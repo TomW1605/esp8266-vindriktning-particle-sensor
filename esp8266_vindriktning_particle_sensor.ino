@@ -1,7 +1,6 @@
 #include <ArduinoJson.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
-//#include <ESP8266WebServer.h>
 #include <ESP8266WiFi.h>
 #include <PubSubClient.h>
 #include <WiFiManager.h>
@@ -17,10 +16,11 @@ uint8_t mqttRetryCounter = 0;
 WiFiManager wifiManager;
 WiFiClient wifiClient;
 PubSubClient mqttClient;
+Config config;
 
-WiFiManagerParameter custom_mqtt_server("server", "mqtt server", Config::mqtt_server, sizeof(Config::mqtt_server));
-WiFiManagerParameter custom_mqtt_user("user", "MQTT username", Config::username, sizeof(Config::username));
-WiFiManagerParameter custom_mqtt_pass("pass", "MQTT password", Config::password, sizeof(Config::password));
+WiFiManagerParameter custom_mqtt_server("server", "mqtt server", config.mqtt_server, sizeof(config.mqtt_server));
+WiFiManagerParameter custom_mqtt_user("user", "MQTT username", config.username, sizeof(config.username));
+WiFiManagerParameter custom_mqtt_pass("pass", "MQTT password", config.password, sizeof(config.password));
 
 uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
@@ -34,18 +34,20 @@ char identifier[24];
 #define AVAILABILITY_OFFLINE "offline"
 char MQTT_TOPIC_AVAILABILITY[128];
 char MQTT_TOPIC_STATE[128];
-char MQTT_TOPIC_COMMAND[128];
 
 char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
 
-bool shouldSaveConfig = false;
-
-void saveConfigCallback() {
-  shouldSaveConfig = true;
+void saveCallback() {
+  Serial.println("saving config to if SPIFFS");
+  strcpy(config.mqtt_server, custom_mqtt_server.getValue());
+  strcpy(config.username, custom_mqtt_user.getValue());
+  strcpy(config.password, custom_mqtt_pass.getValue());
+  config.save();
+  setupMQTT();
+  mqttConnect();
+  config.load();
 }
-
-//ESP8266WebServer server(80);   //Web server object. Will be listening in port 80 (default for HTTP)
 
 void setupCallbacks() {
   wifiManager.server->on("/state", []() {
@@ -56,26 +58,11 @@ void setupCallbacks() {
                      "IP Address: " + WiFi.localIP().toString() + "<br>"\
                      "MAC Address: " + String(WiFi.macAddress()) + "<br>"\
                      "RSSI: " + String(WiFi.RSSI()) + " dBm<br>"\
-                     "MQTT Server: " + String(Config::mqtt_server) + "<br>"\
-                     "MQTT Connected: " + (isMqttConnected() ? "True" : "False") + "<br>"\
+                     "MQTT Server: " + String(config.mqtt_server) + "<br>"\
+                     "MQTT Connected: " + (mqttClient.connected() ? "True" : "False") + "<br>"\
                      "PM 2.5 reading: " + String(state.avgPM25) + " &micro;g/m<sup>3</sup><br>";
     wifiManager.server->send(200, "text/html", message);
   });
-
-  /*server.onNotFound([]() {
-    String message = "File Not Found\n\n";
-    message += "URI: ";
-    message += server.uri();
-    message += "\nMethod: ";
-    message += (server.method() == HTTP_GET) ? "GET" : "POST";
-    message += "\nArguments: ";
-    message += server.args();
-    message += "\n";
-    for (uint8_t i = 0; i < server.args(); i++) {
-      message += " " + server.argName(i) + ": " + server.arg(i) + "\n";
-    }
-    server.send(404, "text/plain", message);
-    });*/
 }
 
 void setup() {
@@ -97,30 +84,17 @@ void setup() {
   snprintf(identifier, sizeof(identifier), "VINDRIKTNING-%X", ESP.getChipId());
   snprintf(MQTT_TOPIC_AVAILABILITY, 127, "%s/%s/status", FIRMWARE_PREFIX, identifier);
   snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
-  snprintf(MQTT_TOPIC_COMMAND, 127, "%s/%s/command", FIRMWARE_PREFIX, identifier);
 
   snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX, identifier);
   snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
 
   WiFi.hostname(identifier);
 
-  Config::load();
+  config.load();
 
   setupWifi();
+  setupMQTT();
   setupOTA();
-  mqttClient.setServer(Config::mqtt_server, 1883);
-  mqttClient.setKeepAlive(10);
-  mqttClient.setBufferSize(2048);
-  mqttClient.setCallback(mqttCallback);
-
-  //setupCallbacks();
-
-  //server.begin();
-  Serial.println("HTTP server started");
-  Serial.print("local ip: ");
-  Serial.println(WiFi.localIP());
-  Serial.print("MAC: ");
-  Serial.println(WiFi.macAddress());
 
   Serial.printf("Hostname: %s\n", identifier);
   Serial.printf("IP: %s\n", WiFi.localIP().toString().c_str());
@@ -128,7 +102,7 @@ void setup() {
   Serial.println("-- Current GPIO Configuration --");
   Serial.printf("PIN_UART_RX: %d\n", SerialCom::PIN_UART_RX);
 
-  mqttReconnect();
+  mqttConnect();
 }
 
 void setupOTA() {
@@ -163,35 +137,11 @@ void setupOTA() {
   ArduinoOTA.begin();
 }
 
-void loop() {
-  //server.handleClient();
-  ArduinoOTA.handle();
-  SerialCom::handleUart(state);
-  mqttClient.loop();
-  wifiManager.process();
-
-  const uint32_t currentMillis = millis();
-  if (currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
-    statusPublishPreviousMillis = currentMillis;
-
-    if (state.valid) {
-      printf("Publish state\n");
-      publishState();
-    }
-  }
-
-  if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
-    lastMqttConnectionAttempt = currentMillis;
-    printf("Reconnect mqtt\n");
-    mqttReconnect();
-  }
-}
-
 void setupWifi() {
   wifiManager.setClass("invert");
-  wifiManager.setDebugOutput(true); \
-  wifiManager.setConfigPortalBlocking(false);
-  wifiManager.setSaveConfigCallback(saveConfigCallback);
+  wifiManager.setDebugOutput(true);
+  wifiManager.setSaveConfigCallback(saveCallback);
+  wifiManager.setSaveParamsCallback(saveCallback);
 
   wifiManager.setWebServerCallback(setupCallbacks);
   std::vector<const char *> menu = {"wifi", "wifinoscan", "info", "param", "custom", "close", "sep", "erase", "update", "restart", "exit"};
@@ -204,7 +154,10 @@ void setupWifi() {
   wifiManager.addParameter(&custom_mqtt_user);
   wifiManager.addParameter(&custom_mqtt_pass);
 
-  WiFi.hostname(identifier);
+  custom_mqtt_server.setValue(config.mqtt_server, 80);
+  custom_mqtt_user.setValue(config.username, 24);
+  custom_mqtt_pass.setValue(config.password, 24);
+  
   if (wifiManager.autoConnect(identifier)) {
     Serial.println("connected...yeey :)");
     WiFi.mode(WIFI_STA);
@@ -213,48 +166,54 @@ void setupWifi() {
   else {
     Serial.println("Configportal running");
   }
+}
+
+void setupMQTT()
+{
   mqttClient.setClient(wifiClient);
 
-  custom_mqtt_server.setValue(Config::mqtt_server, 80);
-  custom_mqtt_user.setValue(Config::username, 24);
-  custom_mqtt_pass.setValue(Config::password, 24);
+  mqttClient.setServer(config.mqtt_server, 1883);
+  mqttClient.setKeepAlive(10);
+  mqttClient.setBufferSize(2048);
+  //mqttClient.setCallback(mqttCallback);
+  config.load();
+}
 
-  strcpy(Config::mqtt_server, custom_mqtt_server.getValue());
-  strcpy(Config::username, custom_mqtt_user.getValue());
-  strcpy(Config::password, custom_mqtt_pass.getValue());
+void loop() {
+  ArduinoOTA.handle();
+  SerialCom::handleUart(state);
+  mqttClient.loop();
+  wifiManager.process();
 
-  if (shouldSaveConfig) {
-    Config::save();
-  } else {
-    // For some reason, the read values get overwritten in this function
-    // To combat this, we just reload the config
-    // This is most likely a logic error which could be fixed otherwise
-    Config::load();
+  const uint32_t currentMillis = millis();
+  if (mqttClient.connected() && currentMillis - statusPublishPreviousMillis >= statusPublishInterval) {
+    statusPublishPreviousMillis = currentMillis;
+
+    if (state.valid) {
+      printf("Publish state\n");
+      publishState();
+    }
+  }
+
+  if (!mqttClient.connected() && currentMillis - lastMqttConnectionAttempt >= mqttConnectionInterval) {
+    lastMqttConnectionAttempt = currentMillis;
+    printf("Reconnect mqtt\n");
+    mqttConnect();
   }
 }
 
-void resetWifiSettingsAndReboot() {
-  wifiManager.resetSettings();
-  delay(3000);
-  ESP.restart();
-}
-
-void mqttReconnect() {
+void mqttConnect() {
   for (uint8_t attempt = 0; attempt < 3; ++attempt) {
-    if (mqttClient.connect(identifier, Config::username, Config::password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE)) {
+    if (mqttClient.connect(identifier, config.username, config.password, MQTT_TOPIC_AVAILABILITY, 1, true, AVAILABILITY_OFFLINE)) {
       mqttClient.publish(MQTT_TOPIC_AVAILABILITY, AVAILABILITY_ONLINE, true);
       publishAutoConfig();
 
       // Make sure to subscribe after polling the status so that we never execute commands with the default data
-      mqttClient.subscribe(MQTT_TOPIC_COMMAND);
+      //mqttClient.subscribe(MQTT_TOPIC_COMMAND);
       break;
     }
     delay(5000);
   }
-}
-
-bool isMqttConnected() {
-  return mqttClient.connected();
 }
 
 void publishState() {
@@ -274,7 +233,7 @@ void publishState() {
   mqttClient.publish(&MQTT_TOPIC_STATE[0], &payload[0], true);
 }
 
-void mqttCallback(char* topic, uint8_t* payload, unsigned int length) { }
+//void mqttCallback(char* topic, uint8_t* payload, unsigned int length) { }
 
 void publishAutoConfig() {
   char mqttPayload[2048];
