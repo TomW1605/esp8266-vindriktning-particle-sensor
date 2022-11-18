@@ -5,6 +5,9 @@
 #include <PubSubClient.h>
 #include <WiFiManager.h>
 
+#include "Adafruit_CCS811.h"
+Adafruit_CCS811 ccs;
+
 #include "Config.h"
 #include "SerialCom.h"
 #include "Types.h"
@@ -26,7 +29,7 @@ uint32_t lastMqttConnectionAttempt = 0;
 const uint16_t mqttConnectionInterval = 60000; // 1 minute = 60 seconds = 60000 milliseconds
 
 uint32_t statusPublishPreviousMillis = 0;
-const uint16_t statusPublishInterval = 30000; // 30 seconds = 30000 milliseconds
+const uint16_t statusPublishInterval = 1000; // 30 seconds = 30000 milliseconds
 
 char identifier[24];
 #define FIRMWARE_PREFIX "esp8266_vindriktning_particle_sensor"
@@ -37,6 +40,8 @@ char MQTT_TOPIC_STATE[128];
 
 char MQTT_TOPIC_AUTOCONF_WIFI_SENSOR[128];
 char MQTT_TOPIC_AUTOCONF_PM25_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_VOC_SENSOR[128];
+char MQTT_TOPIC_AUTOCONF_CO2_SENSOR[128];
 
 void saveCallback() {
   Serial.println("saving config to if SPIFFS");
@@ -51,6 +56,7 @@ void saveCallback() {
 
 void setupCallbacks() {
   wifiManager.server->on("/state", []() {
+    ccs.readData();
     String message = "<meta http-equiv=\"refresh\" content=\"10\" />"\
                      "<style>body {background-color: black;color: white;}</style>"\
                      "<div><p style=\"text-align:center;\">"\
@@ -60,7 +66,9 @@ void setupCallbacks() {
                      "RSSI: " + String(WiFi.RSSI()) + " dBm<br>"\
                      "MQTT Server: " + String(config.mqtt_server) + "<br>"\
                      "MQTT Connected: " + (mqttClient.connected() ? "True" : "False") + "<br>"\
-                     "PM 2.5 reading: " + String(state.avgPM25) + " &micro;g/m<sup>3</sup><br>";
+                     "PM 2.5 reading: " + String(state.avgPM25) + " &micro;g/m<sup>3</sup><br>"\
+                     "CO2: " + String(ccs.geteCO2()) + " ppm<br>"\
+                     "VOC: " + String(ccs.getTVOC()) + " ppb<br>";
     wifiManager.server->send(200, "text/html", message);
   });
 }
@@ -86,7 +94,16 @@ void setup() {
   snprintf(MQTT_TOPIC_STATE, 127, "%s/%s/state", FIRMWARE_PREFIX, identifier);
 
   snprintf(MQTT_TOPIC_AUTOCONF_PM25_SENSOR, 127, "homeassistant/sensor/%s/%s_pm25/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_VOC_SENSOR, 127, "homeassistant/sensor/%s/%s_voc/config", FIRMWARE_PREFIX, identifier);
+  snprintf(MQTT_TOPIC_AUTOCONF_CO2_SENSOR, 127, "homeassistant/sensor/%s/%s_co2/config", FIRMWARE_PREFIX, identifier);
   snprintf(MQTT_TOPIC_AUTOCONF_WIFI_SENSOR, 127, "homeassistant/sensor/%s/%s_wifi/config", FIRMWARE_PREFIX, identifier);
+
+  int ii = 0;
+  while (!ccs.begin() && ii < 5) {
+    Serial.println("Failed to start sensor! Please check your wiring.");
+    delay(1000);
+    ii++;
+  }
 
   WiFi.hostname(identifier);
 
@@ -157,7 +174,7 @@ void setupWifi() {
   custom_mqtt_server.setValue(config.mqtt_server, 80);
   custom_mqtt_user.setValue(config.username, 24);
   custom_mqtt_pass.setValue(config.password, 24);
-  
+
   if (wifiManager.autoConnect(identifier)) {
     Serial.println("connected...yeey :)");
     WiFi.mode(WIFI_STA);
@@ -227,6 +244,12 @@ void publishState() {
 
   stateJson["pm25"] = state.avgPM25;
 
+  if (ccs.available()) {
+    ccs.readData();
+    stateJson["co2"] = ccs.geteCO2();
+    stateJson["voc"] = ccs.getTVOC();
+  }
+
   stateJson["wifi"] = wifiJson.as<JsonObject>();
 
   serializeJson(stateJson, payload);
@@ -277,6 +300,34 @@ void publishAutoConfig() {
 
   serializeJson(autoconfPayload, mqttPayload);
   mqttClient.publish(&MQTT_TOPIC_AUTOCONF_PM25_SENSOR[0], &mqttPayload[0], true);
+
+  autoconfPayload.clear();
+
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String(" VOC");
+  autoconfPayload["unit_of_measurement"] = "ppb";
+  autoconfPayload["value_template"] = "{{value_json.voc}}";
+  autoconfPayload["unique_id"] = identifier + String("_voc");
+  autoconfPayload["icon"] = "mdi:air-filter";
+
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_VOC_SENSOR[0], &mqttPayload[0], true);
+
+  autoconfPayload.clear();
+
+  autoconfPayload["device"] = device.as<JsonObject>();
+  autoconfPayload["availability_topic"] = MQTT_TOPIC_AVAILABILITY;
+  autoconfPayload["state_topic"] = MQTT_TOPIC_STATE;
+  autoconfPayload["name"] = identifier + String(" CO2");
+  autoconfPayload["unit_of_measurement"] = "ppm";
+  autoconfPayload["value_template"] = "{{value_json.co2}}";
+  autoconfPayload["unique_id"] = identifier + String("_co2");
+  autoconfPayload["icon"] = "mdi:air-filter";
+
+  serializeJson(autoconfPayload, mqttPayload);
+  mqttClient.publish(&MQTT_TOPIC_AUTOCONF_CO2_SENSOR[0], &mqttPayload[0], true);
 
   autoconfPayload.clear();
 }
